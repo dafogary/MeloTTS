@@ -35,7 +35,6 @@ torch.backends.cudnn.allow_tf32 = (
 )
 torch.set_float32_matmul_precision("medium")
 
-
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.sdp_kernel("flash")
 torch.backends.cuda.enable_flash_sdp(True)
@@ -45,248 +44,264 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 global_step = 0
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def run():
-    hps = utils.get_hparams()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    dist.init_process_group(
-        backend="gloo",
-        init_method="env://",  # Due to some training problem,we proposed to use gloo instead of nccl.
-        rank=local_rank,
-    )  # Use torchrun instead of mp.spawn
-    rank = dist.get_rank()
-    n_gpus = dist.get_world_size()
-    
-    torch.manual_seed(hps.train.seed)
-    torch.cuda.set_device(rank)
-    global global_step
-    if rank == 0:
-        logger = utils.get_logger(hps.model_dir)
-        logger.info(hps)
-        utils.check_git_hash(hps.model_dir)
-        writer = SummaryWriter(log_dir=hps.model_dir)
-        writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
-    train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
-    train_sampler = DistributedBucketSampler(
-        train_dataset,
-        hps.train.batch_size,
-        [32, 300, 400, 500, 600, 700, 800, 900, 1000],
-        num_replicas=n_gpus,
-        rank=rank,
-        shuffle=True,
-    )
-    collate_fn = TextAudioSpeakerCollate()
-    train_loader = DataLoader(
-        train_dataset,
-        num_workers=16,
-        shuffle=False,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        batch_sampler=train_sampler,
-        persistent_workers=True,
-        prefetch_factor=4,
-    )  # DataLoader config could be adjusted.
-    if rank == 0:
-        eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps.data)
-        eval_loader = DataLoader(
-            eval_dataset,
-            num_workers=0,
-            shuffle=False,
-            batch_size=1,
-            pin_memory=True,
-            drop_last=False,
-            collate_fn=collate_fn,
+    try:
+        hps = utils.get_hparams()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        dist.init_process_group(
+            backend="gloo",
+            init_method="env://",  # Due to some training problem,we proposed to use gloo instead of nccl.
+            rank=local_rank,
+        )  # Use torchrun instead of mp.spawn
+        rank = dist.get_rank()
+        n_gpus = dist.get_world_size()
+        
+        torch.manual_seed(hps.train.seed)
+        torch.cuda.set_device(rank)
+        global global_step
+        if rank == 0:
+            logger = utils.get_logger(hps.model_dir)
+            logger.info(hps)
+            utils.check_git_hash(hps.model_dir)
+            writer = SummaryWriter(log_dir=hps.model_dir)
+            writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
+        
+        logger.info("Loading the training dataset")
+        train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
+        
+        if not train_dataset.lengths:
+            logger.error("Training dataset is empty. Please check the data paths and files.")
+            return
+        
+        train_sampler = DistributedBucketSampler(
+            train_dataset,
+            hps.train.batch_size,
+            [32, 300, 400, 500, 600, 700, 800, 900, 1000],
+            num_replicas=n_gpus,
+            rank=rank,
+            shuffle=True,
         )
-    if (
-        "use_noise_scaled_mas" in hps.model.keys()
-        and hps.model.use_noise_scaled_mas is True
-    ):
-        print("Using noise scaled MAS for VITS2")
-        mas_noise_scale_initial = 0.01
-        noise_scale_delta = 2e-6
-    else:
-        print("Using normal MAS for VITS1")
-        mas_noise_scale_initial = 0.0
-        noise_scale_delta = 0.0
-    if (
-        "use_duration_discriminator" in hps.model.keys()
-        and hps.model.use_duration_discriminator is True
-    ):
-        print("Using duration discriminator for VITS2")
-        net_dur_disc = DurationDiscriminator(
-            hps.model.hidden_channels,
-            hps.model.hidden_channels,
-            3,
-            0.1,
-            gin_channels=hps.model.gin_channels if hps.data.n_speakers != 0 else 0,
-        ).cuda(rank)
-    if (
-        "use_spk_conditioned_encoder" in hps.model.keys()
-        and hps.model.use_spk_conditioned_encoder is True
-    ):
-        if hps.data.n_speakers == 0:
-            raise ValueError(
-                "n_speakers must be > 0 when using spk conditioned encoder to train multi-speaker model"
+        collate_fn = TextAudioSpeakerCollate()
+        train_loader = DataLoader(
+            train_dataset,
+            num_workers=16,
+            shuffle=False,
+            pin_memory=True,
+            collate_fn=collate_fn,
+            batch_sampler=train_sampler,
+            persistent_workers=True,
+            prefetch_factor=4,
+        )  # DataLoader config could be adjusted.
+        if rank == 0:
+            eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps.data)
+            eval_loader = DataLoader(
+                eval_dataset,
+                num_workers=0,
+                shuffle=False,
+                batch_size=1,
+                pin_memory=True,
+                drop_last=False,
+                collate_fn=collate_fn,
             )
-    else:
-        print("Using normal encoder for VITS1")
+        if (
+            "use_noise_scaled_mas" in hps.model.keys()
+            and hps.model.use_noise_scaled_mas is True
+        ):
+            print("Using noise scaled MAS for VITS2")
+            mas_noise_scale_initial = 0.01
+            noise_scale_delta = 2e-6
+        else:
+            print("Using normal MAS for VITS1")
+            mas_noise_scale_initial = 0.0
+            noise_scale_delta = 0.0
+        if (
+            "use_duration_discriminator" in hps.model.keys()
+            and hps.model.use_duration_discriminator is True
+        ):
+            print("Using duration discriminator for VITS2")
+            net_dur_disc = DurationDiscriminator(
+                hps.model.hidden_channels,
+                hps.model.hidden_channels,
+                3,
+                0.1,
+                gin_channels=hps.model.gin_channels if hps.data.n_speakers != 0 else 0,
+            ).cuda(rank)
+        if (
+            "use_spk_conditioned_encoder" in hps.model.keys()
+            and hps.model.use_spk_conditioned_encoder is True
+        ):
+            if hps.data.n_speakers == 0:
+                raise ValueError(
+                    "n_speakers must be > 0 when using spk conditioned encoder to train multi-speaker model"
+                )
+        else:
+            print("Using normal encoder for VITS1")
 
-    net_g = SynthesizerTrn(
-        len(symbols),
-        hps.data.filter_length // 2 + 1,
-        hps.train.segment_size // hps.data.hop_length,
-        n_speakers=hps.data.n_speakers,
-        mas_noise_scale_initial=mas_noise_scale_initial,
-        noise_scale_delta=noise_scale_delta,
-        **hps.model,
-    ).cuda(rank)
+        net_g = SynthesizerTrn(
+            len(symbols),
+            hps.data.filter_length // 2 + 1,
+            hps.train.segment_size // hps.data.hop_length,
+            n_speakers=hps.data.n_speakers,
+            mas_noise_scale_initial=mas_noise_scale_initial,
+            noise_scale_delta=noise_scale_delta,
+            **hps.model,
+        ).cuda(rank)
 
-    net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
-    optim_g = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, net_g.parameters()),
-        hps.train.learning_rate,
-        betas=hps.train.betas,
-        eps=hps.train.eps,
-    )
-    optim_d = torch.optim.AdamW(
-        net_d.parameters(),
-        hps.train.learning_rate,
-        betas=hps.train.betas,
-        eps=hps.train.eps,
-    )
-    if net_dur_disc is not None:
-        optim_dur_disc = torch.optim.AdamW(
-            net_dur_disc.parameters(),
+        net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+        optim_g = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, net_g.parameters()),
             hps.train.learning_rate,
             betas=hps.train.betas,
             eps=hps.train.eps,
         )
-    else:
-        optim_dur_disc = None
-    net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
-    net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
-    
-    pretrain_G, pretrain_D, pretrain_dur = load_pretrain_model()
-    hps.pretrain_G = hps.pretrain_G or pretrain_G
-    hps.pretrain_D = hps.pretrain_D or pretrain_D
-    hps.pretrain_dur = hps.pretrain_dur or pretrain_dur
-
-    if hps.pretrain_G:
-        utils.load_checkpoint(
-                hps.pretrain_G,
-                net_g,
-                None,
-                skip_optimizer=True
+        optim_d = torch.optim.AdamW(
+            net_d.parameters(),
+            hps.train.learning_rate,
+            betas=hps.train.betas,
+            eps=hps.train.eps,
+        )
+        if net_dur_disc is not None:
+            optim_dur_disc = torch.optim.AdamW(
+                net_dur_disc.parameters(),
+                hps.train.learning_rate,
+                betas=hps.train.betas,
+                eps=hps.train.eps,
             )
-    if hps.pretrain_D:
-        utils.load_checkpoint(
-                hps.pretrain_D,
-                net_d,
-                None,
-                skip_optimizer=True
-            )
+        else:
+            optim_dur_disc = None
+        net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
+        net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
+        
+        pretrain_G, pretrain_D, pretrain_dur = load_pretrain_model()
+        hps.pretrain_G = hps.pretrain_G or pretrain_G
+        hps.pretrain_D = hps.pretrain_D or pretrain_D
+        hps.pretrain_dur = hps.pretrain_dur or pretrain_dur
 
-
-    if net_dur_disc is not None:
-        net_dur_disc = DDP(net_dur_disc, device_ids=[rank], find_unused_parameters=True)
-        if hps.pretrain_dur:
+        if hps.pretrain_G:
             utils.load_checkpoint(
-                    hps.pretrain_dur,
-                    net_dur_disc,
+                    hps.pretrain_G,
+                    net_g,
                     None,
                     skip_optimizer=True
                 )
-                
-    try:
+        if hps.pretrain_D:
+            utils.load_checkpoint(
+                    hps.pretrain_D,
+                    net_d,
+                    None,
+                    skip_optimizer=True
+                )
+
+
         if net_dur_disc is not None:
-            _, _, dur_resume_lr, epoch_str = utils.load_checkpoint(
-                utils.latest_checkpoint_path(hps.model_dir, "DUR_*.pth"),
-                net_dur_disc,
-                optim_dur_disc,
-                skip_optimizer=hps.train.skip_optimizer
-                if "skip_optimizer" in hps.train
-                else True,
-            )
-            _, optim_g, g_resume_lr, epoch_str = utils.load_checkpoint(
-                utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"),
-                net_g,
-                optim_g,
-                skip_optimizer=hps.train.skip_optimizer
-                if "skip_optimizer" in hps.train
-                else True,
-            )
-            _, optim_d, d_resume_lr, epoch_str = utils.load_checkpoint(
-                utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"),
-                net_d,
-                optim_d,
-                skip_optimizer=hps.train.skip_optimizer
-                if "skip_optimizer" in hps.train
-                else True,
-            )
-            if not optim_g.param_groups[0].get("initial_lr"):
-                optim_g.param_groups[0]["initial_lr"] = g_resume_lr
-            if not optim_d.param_groups[0].get("initial_lr"):
-                optim_d.param_groups[0]["initial_lr"] = d_resume_lr
-            if not optim_dur_disc.param_groups[0].get("initial_lr"):
-                optim_dur_disc.param_groups[0]["initial_lr"] = dur_resume_lr
-
-        epoch_str = max(epoch_str, 1)
-        global_step = (epoch_str - 1) * len(train_loader)
-    except Exception as e:
-        print(e)
-        epoch_str = 1
-        global_step = 0
-
-    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-        optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2
-    )
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-        optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2
-    )
-    if net_dur_disc is not None:
-        scheduler_dur_disc = torch.optim.lr_scheduler.ExponentialLR(
-            optim_dur_disc, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2
-        )
-    else:
-        scheduler_dur_disc = None
-    scaler = GradScaler(enabled=hps.train.fp16_run)
-
-    for epoch in range(epoch_str, hps.train.epochs + 1):
+            net_dur_disc = DDP(net_dur_disc, device_ids=[rank], find_unused_parameters=True)
+            if hps.pretrain_dur:
+                utils.load_checkpoint(
+                        hps.pretrain_dur,
+                        net_dur_disc,
+                        None,
+                        skip_optimizer=True
+                    )
+                    
         try:
-            if rank == 0:
-                train_and_evaluate(
-                    rank,
-                    epoch,
-                    hps,
-                    [net_g, net_d, net_dur_disc],
-                    [optim_g, optim_d, optim_dur_disc],
-                    [scheduler_g, scheduler_d, scheduler_dur_disc],
-                    scaler,
-                    [train_loader, eval_loader],
-                    logger,
-                    [writer, writer_eval],
+            if net_dur_disc is not None:
+                _, _, dur_resume_lr, epoch_str = utils.load_checkpoint(
+                    utils.latest_checkpoint_path(hps.model_dir, "DUR_*.pth"),
+                    net_dur_disc,
+                    optim_dur_disc,
+                    skip_optimizer=hps.train.skip_optimizer
+                    if "skip_optimizer" in hps.train
+                    else True,
                 )
-            else:
-                train_and_evaluate(
-                    rank,
-                    epoch,
-                    hps,
-                    [net_g, net_d, net_dur_disc],
-                    [optim_g, optim_d, optim_dur_disc],
-                    [scheduler_g, scheduler_d, scheduler_dur_disc],
-                    scaler,
-                    [train_loader, None],
-                    None,
-                    None,
+                _, optim_g, g_resume_lr, epoch_str = utils.load_checkpoint(
+                    utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"),
+                    net_g,
+                    optim_g,
+                    skip_optimizer=hps.train.skip_optimizer
+                    if "skip_optimizer" in hps.train
+                    else True,
                 )
-        except Exception as e:
-            print(e)
-            torch.cuda.empty_cache()
-        scheduler_g.step()
-        scheduler_d.step()
-        if net_dur_disc is not None:
-            scheduler_dur_disc.step()
+                _, optim_d, d_resume_lr, epoch_str = utils.load_checkpoint(
+                    utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"),
+                    net_d,
+                    optim_d,
+                    skip_optimizer=hps.train.skip_optimizer
+                    if "skip_optimizer" in hps.train
+                    else True,
+                )
+                if not optim_g.param_groups[0].get("initial_lr"):
+                    optim_g.param_groups[0]["initial_lr"] = g_resume_lr
+                if not optim_d.param_groups[0].get("initial_lr"):
+                    optim_d.param_groups[0]["initial_lr"] = d_resume_lr
+                if not optim_dur_disc.param_groups[0].get("initial_lr"):
+                    optim_dur_disc.param_groups[0]["initial_lr"] = dur_resume_lr
 
+            epoch_str = max(epoch_str, 1)
+            global_step = (epoch_str - 1) * len(train_loader)
+        except Exception as e:
+            logger.error(f"An error occurred while loading checkpoints: {e}", exc_info=True)
+            epoch_str = 1
+            global_step = 0
+
+        scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
+            optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2
+        )
+        scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
+            optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2
+        )
+        if net_dur_disc is not None:
+            scheduler_dur_disc = torch.optim.lr_scheduler.ExponentialLR(
+                optim_dur_disc, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2
+            )
+        else:
+            scheduler_dur_disc = None
+        scaler = GradScaler(enabled=hps.train.fp16_run)
+
+        for epoch in range(epoch_str, hps.train.epochs + 1):
+            try:
+                if rank == 0:
+                    train_and_evaluate(
+                        rank,
+                        epoch,
+                        hps,
+                        [net_g, net_d, net_dur_disc],
+                        [optim_g, optim_d, optim_dur_disc],
+                        [scheduler_g, scheduler_d, scheduler_dur_disc],
+                        scaler,
+                        [train_loader, eval_loader],
+                        logger,
+                        [writer, writer_eval],
+                    )
+                else:
+                    train_and_evaluate(
+                        rank,
+                        epoch,
+                        hps,
+                        [net_g, net_d, net_dur_disc],
+                        [optim_g, optim_d, optim_dur_disc],
+                        [scheduler_g, scheduler_d, scheduler_dur_disc],
+                        scaler,
+                        [train_loader, None],
+                        None,
+                        None,
+                    )
+            except Exception as e:
+                logger.error(f"An error occurred during training: {e}", exc_info=True)
+                torch.cuda.empty_cache()
+            scheduler_g.step()
+            scheduler_d.step()
+            if net_dur_disc is not None:
+                scheduler_dur_disc.step()
+
+        logger.info("Training process completed successfully")
+
+    except Exception as e:
+        logger.error(f"An error occurred during setup: {e}", exc_info=True)
+        sys.exit(1)
 
 def train_and_evaluate(
     rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers
@@ -627,9 +642,10 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         audio_sampling_rate=hps.data.sampling_rate,
     )
     generator.train()
-    print('Evauate done')
+    print('Evaluate done')
     torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
     run()
+

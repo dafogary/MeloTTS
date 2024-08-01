@@ -13,7 +13,6 @@ import numpy as np
 
 """Multi speaker version"""
 
-
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     """
     1) loads audio, speaker_id, text pairs
@@ -49,22 +48,15 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         random.shuffle(self.audiopaths_sid_text)
         self._filter()
 
-
     def _filter(self):
         """
         Filter text & store spec lengths
         """
-        # Store spectrogram lengths for Bucketing
-        # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
-        # spec_length = wav_length // hop_length
-
         audiopaths_sid_text_new = []
         lengths = []
         skipped = 0
         logger.info("Init dataset...")
-        for item in tqdm(
-            self.audiopaths_sid_text
-        ):
+        for item in tqdm(self.audiopaths_sid_text):
             try:
                 _id, spk, language, text, phones, tone, word2ph = item
             except:
@@ -81,18 +73,22 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
             else:
                 skipped += 1
-        logger.info(f'min: {min(lengths)}; max: {max(lengths)}' )
-        logger.info(
-            "skipped: "
-            + str(skipped)
-            + ", total: "
-            + str(len(self.audiopaths_sid_text))
-        )
+
+        if not lengths:
+            logger.error('No valid data loaded. Please check your training files.')
+        else:
+            logger.info(f'min: {min(lengths)}; max: {max(lengths)}')
+            logger.info(
+                "skipped: "
+                + str(skipped)
+                + ", total: "
+                + str(len(self.audiopaths_sid_text))
+            )
+
         self.audiopaths_sid_text = audiopaths_sid_text_new
         self.lengths = lengths
 
     def get_audio_text_speaker_pair(self, audiopath_sid_text):
-        # separate filename, speaker_id and text
         audiopath, sid, language, text, phones, tone, word2ph = audiopath_sid_text
 
         bert, ja_bert, phones, tone, language = self.get_text(
@@ -112,8 +108,6 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                     filename, sampling_rate, self.sampling_rate
                 )
             )
-        # NOTE: normalize has been achieved by torchaudio
-        # audio_norm = audio / self.max_wav_value
         audio_norm = audio_norm.unsqueeze(0)
         spec_filename = filename.replace(".wav", ".spec.pt")
         if self.use_mel_spec_posterior:
@@ -209,7 +203,6 @@ class TextAudioSpeakerCollate:
         ------
         batch: [text_normalized, spec_normalized, wav_normalized, sid]
         """
-        # Right zero-pad all one-hot text sequences to max input length
         _, ids_sorted_decreasing = torch.sort(
             torch.LongTensor([x[1].size(1) for x in batch]), dim=0, descending=True
         )
@@ -325,7 +318,6 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                     buckets.pop(i)
                     self.boundaries.pop(i + 1)
             assert all(len(bucket) > 0 for bucket in buckets)
-        # When one bucket is not traversed
         except Exception as e:
             print("Bucket warning ", e)
             for i in range(len(buckets) - 1, -1, -1):
@@ -344,7 +336,6 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         return buckets, num_samples_per_bucket
 
     def __iter__(self):
-        # deterministically shuffle based on epoch
         g = torch.Generator()
         g.manual_seed(self.epoch)
 
@@ -365,7 +356,6 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             ids_bucket = indices[i]
             num_samples_bucket = self.num_samples_per_bucket[i]
 
-            # add extra samples to make it evenly divisible
             rem = num_samples_bucket - len_bucket
             ids_bucket = (
                 ids_bucket
@@ -373,10 +363,8 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                 + ids_bucket[: (rem % len_bucket)]
             )
 
-            # subsample
             ids_bucket = ids_bucket[self.rank :: self.num_replicas]
 
-            # batching
             for j in range(len(ids_bucket) // self.batch_size):
                 batch = [
                     bucket[idx]
@@ -411,3 +399,4 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
 
     def __len__(self):
         return self.num_samples // self.batch_size
+
