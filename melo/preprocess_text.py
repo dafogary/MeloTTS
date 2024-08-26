@@ -13,7 +13,7 @@ from text.symbols import symbols, num_languages, num_tones
 @click.command()
 @click.option(
     "--metadata",
-    default="data/example/metadata.list",
+    default="data/DAFOTrain.list",
     type=click.Path(exists=True, file_okay=True, dir_okay=False),
 )
 @click.option("--cleaned-path", default=None)
